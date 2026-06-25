@@ -44,11 +44,9 @@ ViewStepManual <- ggproto('ViewStepManual', ViewStep,
     step_length <- rep(params$step_length, length.out = nsteps)
     pause_length <- rep(params$pause_length, length.out = nsteps)
     if (!params$pause_first) {
-      pause_length <- c(0, pause_length[-length(pause_length)])
-      if (!params$wrap) {
-        step_length[length(step_length)] <- 0
-      }
-    } else if (!params$wrap) {
+      pause_length <- c(0, head(pause_length, -1))
+    }
+    if (!params$wrap) {
       step_length[length(step_length)] <- 0
     }
     params$step_length <- step_length
