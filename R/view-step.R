@@ -94,10 +94,10 @@ ViewStep <- ggproto('ViewStep', View,
     pause_length <- rep(params$pause_length, length.out = nsteps)
     look_ahead <- rep(params$look_ahead, length.out = nsteps)
     if (!params$pause_first) {
-      pause_length <- c(0, pause_length[-length(pause_length)])
-      if (!params$wrap) {
-        step_length[length(step_length)] <- 0
-      }
+      pause_length <- c(0, pause_length)
+      step_length <- c(step_length, 0)
+      look_ahead <- c(look_ahead, look_ahead[1])
+      if (!params$wrap) step_length[length(step_length) - 1] <- 0
     } else if (!params$wrap) {
       step_length[length(step_length)] <- 0
     }
@@ -167,7 +167,7 @@ ViewStep <- ggproto('ViewStep', View,
       }
     }
     frame_ranges <- frame_ranges[frame_ranges$.frame <= params$nframes, ]
-    frame_ranges$.frame <- ((frame_ranges$.frame - 1L) + round(params$delay * frames$mod)) %% params$nframes
+    frame_ranges$.frame <- (frame_ranges$.frame + round(params$delay * frames$mod)) %% params$nframes
     frame_ranges <- frame_ranges[order(frame_ranges$.frame), ]
     params$frame_ranges <- frame_ranges
     params
