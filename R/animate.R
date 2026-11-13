@@ -344,11 +344,6 @@ plot_dims <- function(plot, ref_frame) {
 is_knitting <- function() isTRUE(getOption("knitr.in.progress"))
 
 render_frame <- function(frame) {
-  class_ggplot_built <- get0("class_ggplot_built", asNamespace("ggplot2"))
-  if (is.function(class_ggplot_built)) {
-    frame <- class_ggplot_built(data = frame$data, layout = frame$layout, plot = frame$plot)
-  } else {
-    class(frame) <- "ggplot_built"
-  }
+  frame <- ggplot2::class_ggplot_built(data = frame$data, layout = frame$layout, plot = frame$plot)
   ggplot_gtable(frame)
 }

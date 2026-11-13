@@ -30,9 +30,7 @@ ggplot_build.gganim <- function(plot, ...) {
   # `setup_plot_labels()` is an internal function, but I'm sure the ggplot2
   # devs allow us some grace and leniency.
   setup_plot_labels <- get0("setup_plot_labels", asNamespace("ggplot2"))
-  if (is.function(setup_plot_labels)) {
-    plot$labels <- setup_plot_labels(plot, layers, data)
-  }
+  plot$labels <- setup_plot_labels(plot, layers, data)
   plot$labels[names(scale_labels)] <- scale_labels
   # --
 
@@ -102,34 +100,22 @@ ggplot_build.gganim <- function(plot, ...) {
 
   layout$setup_panel_guides(plot$guides, plot$layers)
 
-  complete_theme <- get0("complete_theme", asNamespace("ggplot2"))
-  if (is.function(complete_theme)) {
-    plot$theme <- complete_theme(plot$theme)
-  }
+  plot$theme <- ggplot2::complete_theme(plot$theme)
 
   # Train and map non-position scales
   npscales <- scales$non_position_scales()
   if (npscales$n() > 0) {
-    if (is.function(npscales$set_palettes)) {
-      npscales$set_palettes(plot$theme)
-      lapply(data, npscales$train_df)
-      plot$guides <- plot$guides$build(npscales, plot$layers, plot$labels, data, theme = plot$theme)
-    } else {
-      lapply(data, npscales$train_df)
-      plot$guides <- plot$guides$build(npscales, plot$layers, plot$labels, data)
-    }
+    npscales$set_palettes(plot$theme)
+    lapply(data, npscales$train_df)
+    plot$guides <- plot$guides$build(npscales, plot$layers, plot$labels, data, theme = plot$theme)
     data <- lapply(data, npscales$map_df)
   }
 
   # Fill in defaults etc.
-  if (is.function(complete_theme)) {
-    data <- by_layer(
-      function(l, d) l$compute_geom_2(d, theme = plot$theme),
-      layers, data, "setting up geom aesthetics"
-    )
-  } else {
-    data <- by_layer(function(l, d) l$compute_geom_2(d), layers, data, "setting up geom aesthetics")
-  }
+  data <- by_layer(
+    function(l, d) l$compute_geom_2(d, theme = plot$theme),
+    layers, data, "setting up geom aesthetics"
+  )
 
   # gganimate
   data <- scene$after_defaults(data)

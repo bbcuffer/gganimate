@@ -1,5 +1,6 @@
 # gganimate (development version)
 
+* gganimate now requires ggplot2 4.0.0 or later.
 # gganimate 1.0.11
 
 * Fix an issue with label rendering in ggplot2 v4
