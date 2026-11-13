@@ -71,6 +71,35 @@
 #' - `fig.width`, `fig.height`, `fig.asp`, `fig.dim`: will set `width` and
 #'   `height` of the device.
 #'
+#' @section Parallel rendering:
+#' If [mirai][mirai::daemons] daemons are running, the frames are drawn in
+#' parallel on those workers whenever the device writes to files (i.e. not
+#' `device = 'current'`). Set `options(gganimate.parallel = FALSE)` to render
+#' sequentially even when daemons are running.
+#'
+#' Workers are separate R sessions, so it helps to know what runs where. The
+#' plot is built in the main session: `aes()`, layer data and parameters,
+#' stats, scales, legends and the theme (including [ggplot2::theme_set()] and
+#' ggplot2's options) are all worked out before anything is sent. So is each
+#' frame's data, view and labels, so scale functions under a moving view (e.g.
+#' [view_follow()]) and variables used in glue labels don't need to exist on
+#' the workers.
+#'
+#' The workers draw the frames. Before drawing they load the packages loaded in
+#' the main session and attach the ones attached in it; if a package is not
+#' installed for the workers, the frames are rendered sequentially with a
+#' warning. Code that runs while a frame is drawn and refers to objects defined
+#' in the session, such as a facet labeller, a custom geom or an S3 method, and
+#' fonts registered with e.g. `systemfonts::register_font()`, must be set up on
+#' the workers with [mirai::everywhere()] before calling `animate()`. Other
+#' options are not copied, except that the `type` of the `png`, `jpeg`, `tiff`
+#' and `bmp` devices defaults to the main session's `getOption("bitmapType")`,
+#' so the output matches sequential rendering.
+#'
+#' Whether or not frames are rendered in parallel, each distinct warning is
+#' raised once, and frames that fail to render are reported together in one
+#' warning. If every frame fails, `animate()` throws an error.
+#'
 #' @section Label variables:
 #' All plots have a certain set of variables available for string literal
 #' interpolation within plot labels. These are:
@@ -246,13 +275,13 @@ prerender <- function(plot, nframes) {
 draw_frames <- function(plot, frames, device, ref_frame, ...) {
   stream <- device == 'current'
 
-  dims <- try_fetch(
-    plot_dims(plot, ref_frame),
-    error = function(e) {
-      cli::cli_warn('Cannot get dimensions of plot table. Plot region might not be fixed', parent = e)
-      list(widths = NULL, heights = NULL)
-    }
-  )
+  dims <- capture_conditions(plot_dims(plot, ref_frame))
+  if (!is.null(dims$error)) {
+    cli::cli_warn(c(
+      'Cannot get dimensions of plot table. Plot region might not be fixed',
+      cli_values(dims$error, 'x')
+    ))
+  }
 
   dir <- tempfile(pattern = '')
   dir.create(dir, showWarnings = FALSE)
@@ -271,7 +300,7 @@ draw_frames <- function(plot, frames, device, ref_frame, ...) {
     current = files,
     cli::cli_abort('Unsupported device: {device}')
   )
-  device <- switch(
+  device_fn <- switch(
     device,
     ragg_png = ragg::agg_png,
     png = png,
@@ -283,38 +312,265 @@ draw_frames <- function(plot, frames, device, ref_frame, ...) {
     svg = svg,
     svglite = svglite::svglite
   )
-  args <- list(...)
-  args <- args[names(args) %in% names(formals(device))]
+  # How to draw each frame, the same for sequential and parallel rendering
+  render <- list(widths = dims$value$widths, heights = dims$value$heights)
+  if (!stream) {
+    dev_args <- list(...)
+    dev_args <- dev_args[names(dev_args) %in% names(formals(device_fn))]
+    render$device_fn <- device_fn
+    render$dev_args <- resolve_device_defaults(device_fn, dev_args)
+  }
 
+  results <- if (!stream && parallel_available()) {
+    render_parallel(plot, frames, files, render)
+  }
+  parallel <- !is.null(results)
+  if (!parallel) results <- render_sequential(plot, frames, files, render)
+  report_frames(results, parallel, dims$warnings)
+
+  frame_vars <- plot$scene$frame_vars[frames, , drop = FALSE]
+  if (!stream) frame_vars$frame_source <- files
+  frame_vars
+}
+
+# Draw one frame: `make_frame()` returns it, from get_frame() or, on a worker,
+# from the parts computed in the main session
+render_one <- function(make_frame, file, render) {
+  if (!is.null(render$device_fn)) {
+    inject(render$device_fn(file, !!!render$dev_args))
+    on.exit(grDevices::dev.off(), add = TRUE)
+  }
+  frame <- make_frame()
+  frame$scene$draw_frame(frame, widths = render$widths, heights = render$heights)
+}
+
+# Evaluate `expr`, keeping its value, the message of any error and the
+# messages of any warnings. Both rendering paths report frames this way, so
+# a warning repeated in every frame is raised once.
+capture_conditions <- function(expr) {
+  warnings <- character()
+  result <- withCallingHandlers(
+    tryCatch(
+      list(value = expr, error = NULL),
+      error = function(e) list(value = NULL, error = condition_text(e))
+    ),
+    warning = function(w) {
+      warnings <<- c(warnings, conditionMessage(w))
+      tryInvokeRestart('muffleWarning')
+    }
+  )
+  result$warnings <- unique(warnings)
+  result
+}
+
+render_sequential <- function(plot, frames, files, render) {
   pb <- progress_bar$new(
     'Rendering [:bar] at :fps fps ~ eta: :eta',
     total = length(frames)
   )
   start <- Sys.time()
   pb$tick(0)
-
+  results <- vector('list', length(frames))
   for (i in seq_along(frames)) {
-    if (!stream) inject(device(files[i], !!!args))
-
-    try_fetch(
-      plot$scene$plot_frame(plot, frames[i], widths = dims$widths, heights = dims$heights),
-      error = function(e) {
-        cli::cli_warn('Failed to plot frame', parent = e)
-      }
+    results[[i]] <- capture_conditions(
+      render_one(function() plot$scene$get_frame(plot, frames[i]), files[i], render)
     )
-
     rate <- i/as.double(Sys.time() - start, units = 'secs')
     if (is.nan(rate)) rate <- 0
     rate <- format(rate, digits = 2)
     pb$tick(tokens = list(fps = rate))
-
-    if (!stream) dev.off()
   }
-
-  frame_vars <- plot$scene$frame_vars[frames, , drop = FALSE]
-  if (!stream) frame_vars$frame_source <- files
-  frame_vars
+  results
 }
+
+report_frames <- function(results, parallel, warnings = character()) {
+  warnings <- unique(c(warnings, unlist(lapply(results, `[[`, 'warnings'))))
+  for (msg in warnings) warning(msg, call. = FALSE)
+
+  errors <- unlist(lapply(results, `[[`, 'error'))
+  n_errors <- length(errors)
+  if (n_errors == 0L) return(invisible())
+  bullets <- cli_values(unique(errors), 'x')
+  # Every frame failing points to the setup (a missing package or font, say)
+  # rather than a bad frame, so don't hand back a blank animation
+  if (n_errors == length(results)) {
+    cli::cli_abort(c(
+      'All {n_errors} frames failed to render',
+      bullets,
+      i = if (parallel) 'Workers get the packages loaded in this session, but not fonts or objects defined in it. Code that runs while a frame is drawn, such as a facet labeller or a custom geom, needs everything it uses set up with {.fn mirai::everywhere} before calling {.fn animate}. Or render sequentially with {.code options(gganimate.parallel = FALSE)}.'
+    ))
+  }
+  cli::cli_warn(c('{n_errors} frame{?s} failed to render', bullets))
+}
+
+# Bullets for cli that show each message as is: braces in them must not be
+# read as cli markup
+cli_values <- function(x, bullet) {
+  x <- gsub('}', '}}', gsub('{', '{{', x, fixed = TRUE), fixed = TRUE)
+  stats::setNames(x, rep(bullet, length(x)))
+}
+
+condition_text <- function(x) {
+  if (inherits(x, 'condition')) conditionMessage(x) else format(x)
+}
+
+# Parallel rendering on mirai workers ------------------------------------------
+#
+# The main session computes every frame (get_frame(): its data, view and
+# labels), exactly as for sequential rendering, so user code that runs per
+# frame (scale functions under a moving view, variables in glue labels) never
+# runs on a worker. Workers only draw. They get, once each, the plot without
+# its tweened data plus each frame's parts; each task is just a frame index.
+
+parallel_available <- function() {
+  isTRUE(getOption('gganimate.parallel', TRUE)) &&
+    requireNamespace('mirai', quietly = TRUE) &&
+    isTRUE(tryCatch(mirai::status()$connections > 0L, error = function(e) FALSE))
+}
+
+# Returns NULL, having warned, if the workers could not be set up
+render_parallel <- function(plot, frames, files, render) {
+  static_panel_params <- plot$layout$panel_params
+  prepared <- lapply(frames, function(i) {
+    capture_conditions(frame_parts(plot$scene$get_frame(plot, i), static_panel_params))
+  })
+  ok <- vapply(prepared, function(p) is.null(p$error), logical(1))
+
+  skeleton <- plot
+  skeleton$data <- NULL
+  job <- list(
+    plot = skeleton,
+    parts = lapply(prepared[ok], `[[`, 'value'),
+    guides = lapply(plot$layout$panel_params, `[[`, 'guides'),
+    files = files[ok],
+    render = render
+  )
+  on.exit(clear_workers(), add = TRUE)
+  if (!setup_workers(job)) return(NULL)
+
+  rendered <- mirai::mirai_map(seq_len(sum(ok)), render_frame_on_worker)[mirai::.progress]
+  results <- prepared
+  results[ok] <- Map(function(p, r) {
+    if (mirai::is_error_value(r)) r <- list(error = condition_text(r))
+    list(error = r$error, warnings = c(p$warnings, r$warnings))
+  }, prepared[ok], rendered)
+  results
+}
+
+# What a worker needs to rebuild a frame: its data and labels and, if the view
+# moved, its panel ranges. Each moving-view frame has a new Guides object,
+# which serialises to megabytes through its links to ggplot2's internals, so
+# only its params (breaks, labels, positions) are sent.
+frame_parts <- function(frame, static_panel_params) {
+  parts <- list(data = frame$data, labels = frame$plot$labels)
+  panel_params <- frame$layout$panel_params
+  if (!identical(panel_params, static_panel_params)) {
+    parts$coord_limits <- frame$layout$coord$limits
+    parts$panel_params <- lapply(panel_params, function(p) {
+      if (inherits(p$guides, 'Guides')) p$guides <- p$guides$params
+      p
+    })
+  }
+  parts
+}
+
+# Runs on a worker. `guides` holds a Guides object per panel to rebuild from.
+assemble_frame <- function(plot, parts, guides) {
+  plot$data <- parts$data
+  plot$plot$labels <- parts$labels
+  if (!is.null(parts$panel_params)) {
+    plot$layout$coord$limits <- parts$coord_limits
+    plot$layout$panel_params <- Map(function(p, template) {
+      if (!is.null(p$guides)) p$guides <- ggproto(NULL, template, params = p$guides)
+      p
+    }, parts$panel_params, guides)
+  }
+  plot
+}
+
+# Runs on a worker. A top-level function serialises with a reference to the
+# gganimate namespace, not a copy of its environment.
+render_frame_on_worker <- function(k) {
+  job <- get('.gganimate_job', envir = globalenv())
+  capture_conditions(render_one(
+    function() assemble_frame(job$plot, job$parts[[k]], job$guides),
+    job$files[[k]], job$render
+  ))
+}
+
+# Send the job to each worker once. Named `...` arguments to everywhere()
+# persist in the worker's global environment; `.args` would not. Workers also
+# load and attach the session's packages: drawing can need S3 methods (e.g.
+# element_grob() for a theme element from another package) and functions
+# called without `pkg::`. Fonts and objects defined in the session must be set
+# up by the caller with mirai::everywhere() before animate().
+# Returns FALSE, with a warning, if any worker could not be set up.
+setup_workers <- function(job) {
+  setup <- mirai::everywhere(
+    worker_setup,
+    .gganimate_job = job,
+    .args = list(packages = session_packages(), libs = .libPaths())
+  )[]
+  failed <- Filter(mirai::is_error_value, setup)
+  if (length(failed) == 0L) return(TRUE)
+  cli::cli_warn(c(
+    'Could not set up the mirai workers, so frames will be rendered sequentially',
+    cli_values(condition_text(failed[[1]]), 'x')
+  ))
+  FALSE
+}
+
+# Quoted: `libs` and `packages` come from everywhere()'s `.args`
+worker_setup <- quote({
+  .libPaths(unique(c(libs[dir.exists(libs)], .libPaths())))
+  loadNamespace('gganimate')
+  get('prepare_worker', envir = asNamespace('gganimate'))(packages)
+})
+
+session_packages <- function() {
+  base <- c('base', 'datasets', 'graphics', 'grDevices', 'methods', 'stats', 'utils')
+  attached <- sub('^package:', '', grep('^package:', search(), value = TRUE))
+  list(
+    loaded = setdiff(loadedNamespaces(), base),
+    # Attach from the end of the search path so the order matches the session
+    attached = rev(setdiff(attached, base))
+  )
+}
+
+# Runs on a worker
+prepare_worker <- function(packages) {
+  available <- vapply(packages$loaded, requireNamespace, logical(1), quietly = TRUE)
+  if (!all(available)) {
+    stop(
+      'Packages loaded in the main session are not installed for the workers: ',
+      paste(packages$loaded[!available], collapse = ', '),
+      call. = FALSE
+    )
+  }
+  for (pkg in packages$attached) {
+    if (!paste0('package:', pkg) %in% search()) {
+      suppressPackageStartupMessages(attachNamespace(pkg))
+    }
+  }
+  TRUE
+}
+
+clear_workers <- function() {
+  mirai::everywhere(suppressWarnings(rm(list = '.gganimate_job', envir = globalenv())))
+}
+
+# Workers start with fresh options, so device defaults that read the session's
+# options must be resolved here. grDevices' bitmap devices (png, jpeg, tiff,
+# bmp) default `type` to getOption("bitmapType"), which e.g. RStudio changes.
+resolve_device_defaults <- function(device_fn, dev_args) {
+  is_bitmap_device <- identical(environment(device_fn), asNamespace('grDevices')) &&
+    'type' %in% names(formals(device_fn))
+  if (is_bitmap_device && is.null(dev_args$type)) {
+    dev_args$type <- getOption('bitmapType')
+  }
+  dev_args
+}
+
 # Get dimensions of plot based on a reference frame
 plot_dims <- function(plot, ref_frame) {
   tmpf <- tempfile()

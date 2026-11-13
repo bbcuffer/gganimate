@@ -1,6 +1,15 @@
 # gganimate (development version)
 
 * gganimate now requires ggplot2 4.0.0 or later.
+* Frames are now rendered in parallel when mirai daemons are running (set up
+  with `mirai::daemons()`). Frames are prepared in the main session and drawn
+  on the workers, which load the session's packages. Use
+  `options(gganimate.parallel = FALSE)` to opt out.
+* Warnings raised while rendering are given once per animation rather than once
+  per frame, failed frames are reported together, and `animate()` throws an
+  error if every frame fails.
+* A label that glue can't interpolate now gives a warning instead of being
+  silently shown as written.
 # gganimate 1.0.11
 
 * Fix an issue with label rendering in ggplot2 v4

@@ -119,8 +119,13 @@ Scene <- ggproto('Scene', NULL,
     plot
   },
   plot_frame = function(self, plot, i, newpage = is.null(vp), vp = NULL, widths = NULL, heights = NULL, ...) {
-    plot <- self$get_frame(plot, i)
-    plot <- render_frame(plot)
+    frame <- self$get_frame(plot, i)
+    self$draw_frame(frame, newpage = newpage, vp = vp, widths = widths, heights = heights)
+  },
+  # Draws a frame from get_frame(). Kept apart so that parallel workers can
+  # draw frames whose data, view and labels were computed in the main session.
+  draw_frame = function(self, frame, newpage = is.null(vp), vp = NULL, widths = NULL, heights = NULL) {
+    plot <- render_frame(frame)
     if (!is.null(widths)) plot$widths <- widths
     if (!is.null(heights)) plot$heights <- heights
     if (newpage) grid.newpage()
@@ -149,12 +154,18 @@ Scene <- ggproto('Scene', NULL,
         label <- list(label)
       }
       new_label <- lapply(label, function(l) {
-        l2 <- try(glue_call(label_var, l, .envir = plot$plot$plot_env), silent = TRUE)
-        if (inherits(l2, 'try-error')) {
-          l
-        } else {
-          l2
-        }
+        try_fetch(
+          glue_call(label_var, l, .envir = plot$plot$plot_env),
+          error = function(e) {
+            # draw_frames() raises each distinct warning once per animation
+            cli::cli_warn(
+              c('Could not interpolate the label {.val {format_label(l)}}, so it is shown as written',
+                i = 'Double any braces that should appear literally, e.g. {.code "{{{{x}}}}"}.'),
+              parent = e
+            )
+            l
+          }
+        )
       })
       if (orig_call) {
         new_label[[1]]
@@ -185,6 +196,10 @@ Scene <- ggproto('Scene', NULL,
     vapply(layers, tween_before_stat, logical(1))
   }
 )
+
+format_label <- function(x) {
+  if (is.character(x)) x else paste(deparse(x), collapse = ' ')
+}
 
 glue_call <- function(.x, call, .envir) {
   if (is_string(call)) {

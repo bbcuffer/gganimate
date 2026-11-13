@@ -118,6 +118,37 @@ supported are:
 }
 }
 
+\section{Parallel rendering}{
+
+If \link[mirai:daemons]{mirai} daemons are running, the frames are drawn in
+parallel on those workers whenever the device writes to files (i.e. not
+\code{device = 'current'}). Set \code{options(gganimate.parallel = FALSE)} to render
+sequentially even when daemons are running.
+
+Workers are separate R sessions, so it helps to know what runs where. The
+plot is built in the main session: \code{aes()}, layer data and parameters,
+stats, scales, legends and the theme (including \code{\link[ggplot2:get_theme]{ggplot2::theme_set()}} and
+ggplot2's options) are all worked out before anything is sent. So is each
+frame's data, view and labels, so scale functions under a moving view (e.g.
+\code{\link[=view_follow]{view_follow()}}) and variables used in glue labels don't need to exist on
+the workers.
+
+The workers draw the frames. Before drawing they load the packages loaded in
+the main session and attach the ones attached in it; if a package is not
+installed for the workers, the frames are rendered sequentially with a
+warning. Code that runs while a frame is drawn and refers to objects defined
+in the session, such as a facet labeller, a custom geom or an S3 method, and
+fonts registered with e.g. \code{systemfonts::register_font()}, must be set up on
+the workers with \code{\link[mirai:everywhere]{mirai::everywhere()}} before calling \code{animate()}. Other
+options are not copied, except that the \code{type} of the \code{png}, \code{jpeg}, \code{tiff}
+and \code{bmp} devices defaults to the main session's \code{getOption("bitmapType")},
+so the output matches sequential rendering.
+
+Whether or not frames are rendered in parallel, each distinct warning is
+raised once, and frames that fail to render are reported together in one
+warning. If every frame fails, \code{animate()} throws an error.
+}
+
 \section{Label variables}{
 
 All plots have a certain set of variables available for string literal

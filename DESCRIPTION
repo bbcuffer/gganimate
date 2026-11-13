@@ -42,11 +42,14 @@ Suggests:
     htmltools,
     knitr,
     magick,
+    mirai,
+    pkgload,
     ragg,
     rmarkdown,
     sf,
     svglite,
-    testthat
+    testthat,
+    withr
 VignetteBuilder: 
     knitr
 Encoding: UTF-8
