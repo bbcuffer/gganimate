@@ -149,6 +149,22 @@ raised once, and frames that fail to render are reported together in one
 warning. If every frame fails, \code{animate()} throws an error.
 }
 
+\section{Layout caching}{
+
+Most of the time spent drawing a frame goes on parts of the plot that are
+the same in every frame: axes, strips, legends and the theme. With
+\code{options(gganimate.cache_layout = TRUE)} these are rendered once and reused,
+and only the layers (plus the title, subtitle and caption, if their text
+changes) are redrawn for each frame. The output is the same as without the
+cache. It works with and without parallel rendering.
+
+The cache is only used with \code{\link[=view_static]{view_static()}} (the default view),
+\code{facet_null()}, \code{facet_wrap()} or \code{facet_grid()}, and \code{coord_cartesian()},
+\code{coord_fixed()} or \code{coord_flip()}. Other plots, and frames in which any other
+label changes, are rendered in full. If the panels can't be found in the
+rendered plot, a warning is given and every frame is rendered in full.
+}
+
 \section{Label variables}{
 
 All plots have a certain set of variables available for string literal

@@ -69,6 +69,7 @@ Collate:
     'import-standalone-obj-type.R'
     'import-standalone-types-check.R'
     'layer_type.R'
+    'layout-cache.R'
     'match_shapes.R'
     'plot-build.R'
     'post_process.R'

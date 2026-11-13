@@ -100,6 +100,20 @@
 #' raised once, and frames that fail to render are reported together in one
 #' warning. If every frame fails, `animate()` throws an error.
 #'
+#' @section Layout caching:
+#' Most of the time spent drawing a frame goes on parts of the plot that are
+#' the same in every frame: axes, strips, legends and the theme. With
+#' `options(gganimate.cache_layout = TRUE)` these are rendered once and reused,
+#' and only the layers (plus the title, subtitle and caption, if their text
+#' changes) are redrawn for each frame. The output is the same as without the
+#' cache. It works with and without parallel rendering.
+#'
+#' The cache is only used with [view_static()] (the default view),
+#' `facet_null()`, `facet_wrap()` or `facet_grid()`, and `coord_cartesian()`,
+#' `coord_fixed()` or `coord_flip()`. Other plots, and frames in which any other
+#' label changes, are rendered in full. If the panels can't be found in the
+#' rendered plot, a warning is given and every frame is rendered in full.
+#'
 #' @section Label variables:
 #' All plots have a certain set of variables available for string literal
 #' interpolation within plot labels. These are:
@@ -313,7 +327,12 @@ draw_frames <- function(plot, frames, device, ref_frame, ...) {
     svglite = svglite::svglite
   )
   # How to draw each frame, the same for sequential and parallel rendering
-  render <- list(widths = dims$value$widths, heights = dims$value$heights)
+  render <- list(
+    widths = dims$value$widths,
+    heights = dims$value$heights,
+    # NULL unless options(gganimate.cache_layout = TRUE) and the plot qualifies
+    cache = layout_cache(plot)
+  )
   if (!stream) {
     dev_args <- list(...)
     dev_args <- dev_args[names(dev_args) %in% names(formals(device_fn))]
@@ -341,7 +360,8 @@ render_one <- function(make_frame, file, render) {
     on.exit(grDevices::dev.off(), add = TRUE)
   }
   frame <- make_frame()
-  frame$scene$draw_frame(frame, widths = render$widths, heights = render$heights)
+  frame$scene$draw_frame(frame, widths = render$widths, heights = render$heights,
+                         cache = render$cache)
 }
 
 # Evaluate `expr`, keeping its value, the message of any error and the

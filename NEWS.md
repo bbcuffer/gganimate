@@ -1,6 +1,10 @@
 # gganimate (development version)
 
 * gganimate now requires ggplot2 4.0.0 or later.
+* New `options(gganimate.cache_layout = TRUE)` renders the parts of the plot
+  that don't change between frames (axes, strips, legends) once and reuses
+  them, which can make rendering about twice as fast. It applies to plots with a
+  static view, the built-in facets and cartesian, fixed or flipped coords.
 * Frames are now rendered in parallel when mirai daemons are running (set up
   with `mirai::daemons()`). Frames are prepared in the main session and drawn
   on the workers, which load the session's packages. Use

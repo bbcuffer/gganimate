@@ -124,8 +124,12 @@ Scene <- ggproto('Scene', NULL,
   },
   # Draws a frame from get_frame(). Kept apart so that parallel workers can
   # draw frames whose data, view and labels were computed in the main session.
-  draw_frame = function(self, frame, newpage = is.null(vp), vp = NULL, widths = NULL, heights = NULL) {
-    plot <- render_frame(frame)
+  draw_frame = function(self, frame, newpage = is.null(vp), vp = NULL, widths = NULL, heights = NULL, cache = NULL) {
+    plot <- if (!is.null(cache)) render_frame_cached(frame, cache)
+    if (is.null(plot)) {
+      plot <- render_frame(frame)
+      if (!is.null(cache)) cache_template(cache, frame, plot)
+    }
     if (!is.null(widths)) plot$widths <- widths
     if (!is.null(heights)) plot$heights <- heights
     if (newpage) grid.newpage()
