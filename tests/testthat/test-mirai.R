@@ -242,6 +242,44 @@ test_that('moving views send each frame\'s guide params, not its Guides object',
   expect_lt(per_frame, 100e3)
 })
 
+test_that('the plot sent to workers does not grow with the data', {
+  skip_mirai()
+  local_daemons(1)
+  sent_plot_size <- function(n) {
+    sent <- NULL
+    local_mocked_bindings(setup_workers = function(job) {
+      sent <<- job
+      FALSE
+    })
+    # Made as in a script: the plot's environment doesn't hold the data
+    # (that environment is sent as it is, whatever it holds)
+    env <- new.env(parent = globalenv())
+    env$df <- data.frame(x = seq_len(n), y = sin(seq_len(n)), g = rep(1:4, length.out = n))
+    p <- evalq(ggplot(df, aes(x, y, colour = factor(g))) + geom_point() + transition_states(g), env)
+    rm('df', envir = env)
+    capture.output(suppressWarnings(render_md5(p, nframes = 4)))
+    length(serialize(sent$plot, NULL))
+  }
+  # Built objects keep references to the frames that made them, which hold
+  # every layer's data; only what drawing needs should be sent
+  expect_lt(sent_plot_size(2e5) - sent_plot_size(100), 1e6)
+})
+
+test_that('preparing the job for workers leaves the session\'s plot as it was', {
+  skip_mirai()
+  local_daemons(1)
+  local_mocked_bindings(setup_workers = function(job) FALSE)
+  plot <- prerender(mirai_test_plot(), 4)
+  layer <- plot$plot$layers[[1]]
+  layer_data <- layer$data
+  scene_parent <- get('super', envir = plot$scene)
+  capture.output(suppressWarnings(draw_frames(plot, seq_len(4), device = 'png', ref_frame = 1)))
+  expect_identical(plot$plot$layers[[1]], layer)
+  expect_identical(layer$data, layer_data)
+  expect_identical(get('super', envir = plot$scene), scene_parent)
+  expect_false(is.null(plot$scene$transition))
+})
+
 # The workers' environment -------------------------------------------------------
 
 test_that('the session theme and ggplot2 options apply to parallel frames', {

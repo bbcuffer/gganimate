@@ -465,13 +465,14 @@ render_parallel <- function(plot, frames, files, render) {
 
   skeleton <- plot
   skeleton$data <- NULL
-  job <- list(
+  job <- detach_frames(list(
     plot = skeleton,
     parts = lapply(prepared[ok], `[[`, 'value'),
-    guides = lapply(plot$layout$panel_params, `[[`, 'guides'),
-    files = files[ok],
-    render = render
-  )
+    guides = lapply(plot$layout$panel_params, `[[`, 'guides')
+  ))
+  job$plot <- drawing_kit(job$plot)
+  job$files <- files[ok]
+  job$render <- render
   on.exit(clear_workers(), add = TRUE)
   if (!setup_workers(job)) return(NULL)
 
@@ -484,10 +485,96 @@ render_parallel <- function(plot, frames, files, render) {
   results
 }
 
+# Trims a copy of a built plot, made by detach_frames(), to what drawing a
+# frame uses: the layout, the plot (layers, theme, guides, labels) and the
+# scene's draw_frame(). What only preparing frames needs (the plot's and
+# layers' original data, the transition, view, shadow and transmuters) stays in
+# the session.
+# The copy's ggproto objects are its own, so they can be changed in place.
+drawing_kit <- function(plot) {
+  # Keep a draw_frame() set on this scene rather than inherited from Scene
+  own_draw <- get0('draw_frame', envir = plot$scene, inherits = FALSE)
+  scene <- if (is.null(own_draw)) ggproto(NULL, Scene) else ggproto(NULL, Scene, draw_frame = own_draw)
+  # Made here, it would otherwise keep this frame and with it the whole plot
+  scene$super <- parent_finder(Scene)
+  plot$scene <- scene
+  gg <- plot$plot
+  gg@meta <- gg@meta[setdiff(names(gg@meta), c('transition', 'view', 'shadow', 'transmuters', 'ease', 'nframes'))]
+  # As for a plot made without data; each frame's data is sent separately
+  gg@data <- waiver()
+  for (layer in gg@layers) layer$data <- NULL
+  plot$plot <- gg
+  plot
+}
+
+# A ggproto object made inside a function keeps that function's frame, through
+# the closure that finds its parent (`super`), and through unevaluated
+# arguments in that frame, the frames of its callers too. For a built plot
+# those reach the build itself, with every layer's data for every frame: a
+# panel's Guides object alone can serialise to hundreds of megabytes. This
+# copies each ggproto object in `x` with a `super` that holds only its parent.
+# The session's objects are left as they are, and objects shared within `x`
+# stay shared.
+detach_frames <- function(x, copies = new.env(parent = emptyenv())) {
+  # A method bound to an object, e.g. a scale's palette, keeps the frame it was
+  # fetched in through its unevaluated `self`
+  if (inherits(x, 'ggproto_method')) {
+    method <- environment(x)
+    return(bound_method(detach_frames(method$f, copies), detach_frames(method$self, copies), method$has_self))
+  }
+  if (inherits(x, 'ggproto')) {
+    key <- rlang::obj_address(x)
+    if (!is.null(copies[[key]])) return(copies[[key]])
+    copy <- new.env(parent = emptyenv())
+    # Registered before its fields, which may refer back to it
+    copies[[key]] <- copy
+    for (name in ls(x, all.names = TRUE)) {
+      assign(name, detach_frames(get(name, envir = x), copies), envir = copy)
+    }
+    find_parent <- get0('super', envir = x, inherits = FALSE)
+    if (is.function(find_parent)) {
+      copy$super <- parent_finder(detach_frames(find_parent(), copies))
+    }
+    class(copy) <- class(x)
+    return(copy)
+  }
+  if (is.list(x) && !is.data.frame(x)) {
+    items <- lapply(x, detach_frames, copies = copies)
+    # Rebuilt only if needed, and without `[<-`, which some classes forbid
+    if (!all(mapply(identical, items, x))) {
+      attrs <- attributes(x)
+      x <- items
+      attributes(x) <- attrs
+    }
+  }
+  # S7 objects such as the ggplot object keep their properties as attributes
+  if (inherits(x, 'S7_object')) {
+    for (name in setdiff(names(attributes(x)), c('class', 'S7_class'))) {
+      attr(x, name) <- detach_frames(attr(x, name), copies)
+    }
+  }
+  x
+}
+
+parent_finder <- function(parent) {
+  force(parent)
+  function() parent
+}
+
+# As ggplot2 binds a method to its object when it is fetched with `$`
+bound_method <- function(f, self, has_self) {
+  # Unevaluated, they would keep the caller's frame
+  force(f)
+  force(self)
+  method <- if (isTRUE(has_self)) function(...) f(..., self = self) else function(...) f(...)
+  class(method) <- 'ggproto_method'
+  method
+}
+
 # What a worker needs to rebuild a frame: its data and labels and, if the view
 # moved, its panel ranges. Each moving-view frame has a new Guides object,
-# which serialises to megabytes through its links to ggplot2's internals, so
-# only its params (breaks, labels, positions) are sent.
+# which keeps the frames that built it (see detach_frames()), so only its
+# params (breaks, labels, positions) are sent.
 frame_parts <- function(frame, static_panel_params) {
   parts <- list(data = frame$data, labels = frame$plot$labels)
   panel_params <- frame$layout$panel_params
