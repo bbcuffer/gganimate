@@ -61,6 +61,32 @@ test_that('frames that fail on workers are reported and workers are cleaned up',
   expect_false(job_left_on_workers())
 })
 
+test_that('a frame that fails while being prepared is reported and the rest are drawn', {
+  plot <- prerender(mirai_test_plot(), 4)
+  get_frame <- plot$scene$get_frame
+  fail_second <- function(self, plot, i) {
+    if (i == 2) stop('bad frame')
+    get_frame(plot, i)
+  }
+  # Enclosed by the global environment, as the scene is sent to the workers
+  environment(fail_second) <- list2env(list(get_frame = get_frame), parent = globalenv())
+  plot$scene$get_frame <- fail_second
+  draw <- function() draw_frames(plot, seq_len(4), device = 'png', ref_frame = 1)
+
+  capture.output(expect_warning(sequential <- draw(), '1 frame failed to render.*bad frame'))
+  skip_mirai()
+  local_daemons(2)
+  expect_warning(parallel <- draw(), '1 frame failed to render.*bad frame')
+  drawn <- c(1, 3, 4)
+  expect_true(all(file.exists(parallel$frame_source[drawn])))
+  expect_false(file.exists(parallel$frame_source[2]))
+  expect_identical(
+    unname(tools::md5sum(parallel$frame_source[drawn])),
+    unname(tools::md5sum(sequential$frame_source[drawn]))
+  )
+  expect_false(job_left_on_workers())
+})
+
 test_that('an error is thrown when every frame fails', {
   plot <- prerender(mirai_test_plot(), 4)
   plot$scene$draw_frame <- function(...) stop('boom')
@@ -240,6 +266,25 @@ test_that('workers load and attach the packages of the main session', {
     c(isNamespaceLoaded('svglite'), 'package:svglite' %in% search())
   )[]
   expect_true(all(unlist(on_workers)))
+})
+
+test_that('workers load packages loaded with load_all() from source, reloading changes', {
+  skip_mirai()
+  skip_if_not_installed('pkgload')
+  path <- local_dev_package('!')
+  # Not installed, so the workers can only get it from its source directory
+  dev_plot <- function() {
+    mirai_test_plot() + getExportedValue('gganimatedevpkg', 'geom_shout')()
+  }
+  sequential <- render_sequential_md5(dev_plot())
+  local_daemons(2)
+  expect_identical(expect_no_warning(render_md5(dev_plot())), sequential)
+
+  write_dev_shout(path, '?')
+  pkgload::load_all(path, helpers = FALSE, quiet = TRUE)
+  changed <- render_sequential_md5(dev_plot())
+  expect_false(identical(changed, sequential))
+  expect_identical(render_md5(dev_plot()), changed)
 })
 
 test_that('draw-time code using session objects fails with a hint until set up', {

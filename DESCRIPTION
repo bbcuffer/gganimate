@@ -42,7 +42,7 @@ Suggests:
     htmltools,
     knitr,
     magick,
-    mirai,
+    mirai (>= 2.5.0),
     pkgload,
     ragg,
     rmarkdown,

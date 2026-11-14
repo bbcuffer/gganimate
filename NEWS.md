@@ -7,7 +7,8 @@
   static view, the built-in facets and cartesian, fixed or flipped coords.
 * Frames are now rendered in parallel when mirai daemons are running (set up
   with `mirai::daemons()`). Frames are prepared in the main session and drawn
-  on the workers, which load the session's packages. Use
+  on the workers, which load the session's packages (from source, for
+  packages loaded with `pkgload::load_all()`). Use
   `options(gganimate.parallel = FALSE)` to opt out.
 * Warnings raised while rendering are given once per animation rather than once
   per frame, failed frames are reported together, and `animate()` throws an

@@ -3,16 +3,13 @@ skip_mirai <- function() {
   skip_if_not_installed('mirai')
 }
 
-# Start daemons for the calling test and stop them when it finishes. Workers
-# load gganimate by namespace, so under devtools::test() they would otherwise
-# get the installed copy rather than the code being tested.
+# Start daemons for the calling test and stop them when it finishes. Under
+# devtools::test() gganimate is loaded with pkgload::load_all(), so the
+# workers loading the same source (rather than an installed copy) is tested by
+# every parallel test.
 local_daemons <- function(n = 2, env = parent.frame()) {
   mirai::daemons(n)
   withr::defer(mirai::daemons(0), envir = env)
-  if (requireNamespace('pkgload', quietly = TRUE) && pkgload::is_dev_package('gganimate')) {
-    path <- getNamespaceInfo('gganimate', 'path')
-    mirai::everywhere(pkgload::load_all(path, quiet = TRUE), path = path)[]
-  }
   invisible()
 }
 
@@ -55,4 +52,35 @@ render_sequential_md5 <- function(p, nframes = 4, ...) {
   out <- NULL
   capture.output(out <- render_md5(p, nframes, ...))
   out
+}
+
+# Load a small package with pkgload::load_all() for the calling test. It is
+# never installed. Its geom_shout() draws shout('frame') at draw time, and
+# shout() appends `suffix`.
+local_dev_package <- function(suffix = '!', env = parent.frame()) {
+  path <- file.path(withr::local_tempdir(.local_envir = env), 'gganimatedevpkg')
+  dir.create(file.path(path, 'R'), recursive = TRUE)
+  writeLines(c(
+    'Package: gganimatedevpkg', 'Version: 0.0.1', 'Title: Test',
+    'Description: Test.', 'License: MIT', 'Encoding: UTF-8'
+  ), file.path(path, 'DESCRIPTION'))
+  writeLines('export(geom_shout)', file.path(path, 'NAMESPACE'))
+  writeLines(c(
+    "GeomShout <- ggplot2::ggproto('GeomShout', ggplot2::Geom,",
+    "  draw_panel = function(data, panel_params, coord) grid::textGrob(shout('frame'))",
+    ")",
+    "geom_shout <- function() ggplot2::layer(geom = GeomShout, stat = 'identity',",
+    "  position = 'identity', params = list())"
+  ), file.path(path, 'R', 'geom.R'))
+  write_dev_shout(path, suffix)
+  pkgload::load_all(path, helpers = FALSE, quiet = TRUE)
+  withr::defer(pkgload::unload('gganimatedevpkg'), envir = env)
+  path
+}
+
+write_dev_shout <- function(path, suffix) {
+  writeLines(
+    sprintf("shout <- function(x) paste0(toupper(x), '%s')", suffix),
+    file.path(path, 'R', 'shout.R')
+  )
 }

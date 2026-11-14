@@ -133,10 +133,16 @@ frame's data, view and labels, so scale functions under a moving view (e.g.
 \code{\link[=view_follow]{view_follow()}}) and variables used in glue labels don't need to exist on
 the workers.
 
-The workers draw the frames. Before drawing they load the packages loaded in
-the main session and attach the ones attached in it; if a package is not
-installed for the workers, the frames are rendered sequentially with a
-warning. Code that runs while a frame is drawn and refers to objects defined
+The workers draw the frames. They must run on this machine, or share its
+file system, because they write the frames to this session's temporary
+directory. Before drawing they load the packages loaded in the main session
+and attach the ones attached in it; packages loaded with
+\code{pkgload::load_all()} are loaded from the same source directory. If a
+package is not installed for the workers, the frames are rendered
+sequentially with a warning. Each worker is sent the whole animation,
+including every frame's data, so a very large animation (thousands of points
+over hundreds of frames, say) takes that much memory on each worker. Code
+that runs while a frame is drawn and refers to objects defined
 in the session, such as a facet labeller, a custom geom or an S3 method, and
 fonts registered with e.g. \code{systemfonts::register_font()}, must be set up on
 the workers with \code{\link[mirai:everywhere]{mirai::everywhere()}} before calling \code{animate()}. Other

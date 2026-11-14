@@ -85,10 +85,16 @@
 #' [view_follow()]) and variables used in glue labels don't need to exist on
 #' the workers.
 #'
-#' The workers draw the frames. Before drawing they load the packages loaded in
-#' the main session and attach the ones attached in it; if a package is not
-#' installed for the workers, the frames are rendered sequentially with a
-#' warning. Code that runs while a frame is drawn and refers to objects defined
+#' The workers draw the frames. They must run on this machine, or share its
+#' file system, because they write the frames to this session's temporary
+#' directory. Before drawing they load the packages loaded in the main session
+#' and attach the ones attached in it; packages loaded with
+#' `pkgload::load_all()` are loaded from the same source directory. If a
+#' package is not installed for the workers, the frames are rendered
+#' sequentially with a warning. Each worker is sent the whole animation,
+#' including every frame's data, so a very large animation (thousands of points
+#' over hundreds of frames, say) takes that much memory on each worker. Code
+#' that runs while a frame is drawn and refers to objects defined
 #' in the session, such as a facet labeller, a custom geom or an S3 method, and
 #' fonts registered with e.g. `systemfonts::register_font()`, must be set up on
 #' the workers with [mirai::everywhere()] before calling `animate()`. Other
@@ -444,7 +450,8 @@ condition_text <- function(x) {
 
 parallel_available <- function() {
   isTRUE(getOption('gganimate.parallel', TRUE)) &&
-    requireNamespace('mirai', quietly = TRUE) &&
+    # Daemons can only be running if mirai is loaded; don't load it to find out
+    isNamespaceLoaded('mirai') &&
     isTRUE(tryCatch(mirai::status()$connections > 0L, error = function(e) FALSE))
 }
 
@@ -518,20 +525,29 @@ render_frame_on_worker <- function(k) {
   ))
 }
 
-# Send the job to each worker once. Named `...` arguments to everywhere()
-# persist in the worker's global environment; `.args` would not. Workers also
-# load and attach the session's packages: drawing can need S3 methods (e.g.
-# element_grob() for a theme element from another package) and functions
-# called without `pkg::`. Fonts and objects defined in the session must be set
-# up by the caller with mirai::everywhere() before animate().
+# Workers first load and attach the session's packages: drawing can need S3
+# methods (e.g. element_grob() for a theme element from another package) and
+# functions called without `pkg::`. Then each gets the job, once. That has to
+# come second: unserialising the job loads the namespaces its functions refer
+# to, which must be the session's versions (see prepare_worker()). Named `...`
+# arguments to everywhere() persist in the worker's global environment; `.args`
+# would not. Fonts and objects defined in the session must be set up by the
+# caller with mirai::everywhere() before animate().
 # Returns FALSE, with a warning, if any worker could not be set up.
 setup_workers <- function(job) {
   setup <- mirai::everywhere(
     worker_setup,
-    .gganimate_job = job,
-    .args = list(packages = session_packages(), libs = .libPaths())
+    .args = list(
+      prepare_worker = by_value(prepare_worker),
+      packages = session_packages(),
+      libs = .libPaths()
+    )
   )[]
   failed <- Filter(mirai::is_error_value, setup)
+  if (length(failed) == 0L) {
+    sent <- mirai::everywhere(TRUE, .gganimate_job = job)[]
+    failed <- Filter(mirai::is_error_value, sent)
+  }
   if (length(failed) == 0L) return(TRUE)
   cli::cli_warn(c(
     'Could not set up the mirai workers, so frames will be rendered sequentially',
@@ -540,25 +556,59 @@ setup_workers <- function(job) {
   FALSE
 }
 
-# Quoted: `libs` and `packages` come from everywhere()'s `.args`
-worker_setup <- quote({
-  .libPaths(unique(c(libs[dir.exists(libs)], .libPaths())))
-  loadNamespace('gganimate')
-  get('prepare_worker', envir = asNamespace('gganimate'))(packages)
-})
+# Quoted: its variables come from everywhere()'s `.args`
+worker_setup <- quote(prepare_worker(packages, libs))
+
+# A copy of a function that serialises with its code rather than as a
+# reference to the gganimate namespace, so a worker can run it before loading
+# gganimate. It may only use base R and `pkg::` calls.
+by_value <- function(fn) {
+  environment(fn) <- baseenv()
+  fn
+}
 
 session_packages <- function() {
   base <- c('base', 'datasets', 'graphics', 'grDevices', 'methods', 'stats', 'utils')
+  loaded <- setdiff(loadedNamespaces(), base)
   attached <- sub('^package:', '', grep('^package:', search(), value = TRUE))
+  dev <- if (isNamespaceLoaded('pkgload')) Filter(pkgload::is_dev_package, loaded)
   list(
-    loaded = setdiff(loadedNamespaces(), base),
+    loaded = loaded,
     # Attach from the end of the search path so the order matches the session
-    attached = rev(setdiff(attached, base))
+    attached = rev(setdiff(attached, base)),
+    # Source directories of packages loaded with pkgload::load_all()
+    dev = vapply(dev, getNamespaceInfo, character(1), which = 'path')
   )
 }
 
-# Runs on a worker
-prepare_worker <- function(packages) {
+# Runs on a worker, sent by value (see by_value()).
+#
+# Packages loaded with pkgload::load_all() in the session, possibly gganimate
+# itself, are loaded from the same source directory, before anything else can
+# load the installed copy. A worker keeps the packages it has loaded between
+# calls, so it reloads one only when its files have changed. The worker then
+# has the files on disk, which differ from the session's code only if they
+# were edited without reloading.
+prepare_worker <- function(packages, libs) {
+  .libPaths(unique(c(libs[dir.exists(libs)], .libPaths())))
+
+  dev_loaded <- getOption('gganimate.worker_dev_loaded', list())
+  for (path in packages$dev) {
+    sources <- c(
+      file.path(path, c('DESCRIPTION', 'NAMESPACE')),
+      list.files(file.path(path, c('R', 'src')), recursive = TRUE, full.names = TRUE)
+    )
+    fingerprint <- unname(tools::md5sum(sources))
+    if (!identical(dev_loaded[[path]], fingerprint)) {
+      # The session has compiled any code already; workers compiling in the
+      # same directory at once would collide
+      pkgload::load_all(path, compile = FALSE, helpers = FALSE, quiet = TRUE)
+      dev_loaded[[path]] <- fingerprint
+    }
+  }
+  # everywhere() keeps changes to options, so this persists on the worker
+  options(gganimate.worker_dev_loaded = dev_loaded)
+
   available <- vapply(packages$loaded, requireNamespace, logical(1), quietly = TRUE)
   if (!all(available)) {
     stop(
