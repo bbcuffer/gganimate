@@ -13,22 +13,24 @@ data_frame0 <- function(...) vctrs::data_frame(..., .name_repair = "minimal")
 unique0 <- function(x, ...) if (is.null(x)) x else vctrs::vec_unique(x, ...)
 
 # Reimplement get_scales in Layout to allow panels with frame info to get the
-# correct scales
+# correct scales. Defined once, at the top level: a method written inline in
+# create_layout() would keep that call's frame and, through the coord and facet
+# in it, the frames that built them, which hold the plot's data.
 #' @importFrom ggplot2 FacetNull CoordCartesian Layout ggproto
-create_layout <- function(facet = FacetNull, coord = CoordCartesian) {
-  ggproto(NULL, Layout,
-    facet = facet,
-    coord = coord,
-    get_scales = function(self, i) {
-      if (is.character(i)) i <- as.integer(strsplit(i, '<')[[1]][1])
-      this_panel <- self$layout[self$layout$PANEL == i, ]
+LayoutGganim <- ggproto('LayoutGganim', Layout,
+  get_scales = function(self, i) {
+    if (is.character(i)) i <- as.integer(strsplit(i, '<')[[1]][1])
+    this_panel <- self$layout[self$layout$PANEL == i, ]
 
-      list(
-        x = self$panel_scales_x[[this_panel$SCALE_X]],
-        y = self$panel_scales_y[[this_panel$SCALE_Y]]
-      )
-    }
-  )
+    list(
+      x = self$panel_scales_x[[this_panel$SCALE_X]],
+      y = self$panel_scales_y[[this_panel$SCALE_Y]]
+    )
+  }
+)
+
+create_layout <- function(facet = FacetNull, coord = CoordCartesian) {
+  ggproto(NULL, LayoutGganim, facet = facet, coord = coord)
 }
 
 deprecate_soft0 <- function(..., user_env = NULL) {

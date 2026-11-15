@@ -19,7 +19,7 @@ License: MIT + file LICENSE
 URL: https://gganimate.com, https://github.com/thomasp85/gganimate
 BugReports: https://github.com/thomasp85/gganimate/issues
 Depends: 
-    ggplot2 (>= 3.5.2)
+    ggplot2 (>= 4.0.0)
 Imports: 
     cli,
     glue,
@@ -42,11 +42,14 @@ Suggests:
     htmltools,
     knitr,
     magick,
+    mirai (>= 2.5.0),
+    pkgload,
     ragg,
     rmarkdown,
     sf,
     svglite,
     testthat,
+    withr,
     xml2
 VignetteBuilder: 
     knitr
@@ -67,6 +70,7 @@ Collate:
     'import-standalone-obj-type.R'
     'import-standalone-types-check.R'
     'layer_type.R'
+    'layout-cache.R'
     'match_shapes.R'
     'plot-build.R'
     'post_process.R'

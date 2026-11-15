@@ -71,6 +71,55 @@
 #' - `fig.width`, `fig.height`, `fig.asp`, `fig.dim`: will set `width` and
 #'   `height` of the device.
 #'
+#' @section Parallel rendering:
+#' If [mirai][mirai::daemons] daemons are running, the frames are drawn in
+#' parallel on those workers whenever the device writes to files (i.e. not
+#' `device = 'current'`). Set `options(gganimate.parallel = FALSE)` to render
+#' sequentially even when daemons are running.
+#'
+#' Workers are separate R sessions, so it helps to know what runs where. The
+#' plot is built in the main session: `aes()`, layer data and parameters,
+#' stats, scales, legends and the theme (including [ggplot2::theme_set()] and
+#' ggplot2's options) are all worked out before anything is sent. So is each
+#' frame's data, view and labels, so scale functions under a moving view (e.g.
+#' [view_follow()]) and variables used in glue labels don't need to exist on
+#' the workers.
+#'
+#' The workers draw the frames. They must run on this machine, or share its
+#' file system, because they write the frames to this session's temporary
+#' directory. Before drawing they load the packages loaded in the main session
+#' and attach the ones attached in it; packages loaded with
+#' `pkgload::load_all()` are loaded from the same source directory. If a
+#' package is not installed for the workers, the frames are rendered
+#' sequentially with a warning. Each worker is sent the whole animation,
+#' including every frame's data, so a very large animation (thousands of points
+#' over hundreds of frames, say) takes that much memory on each worker. Code
+#' that runs while a frame is drawn and refers to objects defined
+#' in the session, such as a facet labeller, a custom geom or an S3 method, and
+#' fonts registered with e.g. `systemfonts::register_font()`, must be set up on
+#' the workers with [mirai::everywhere()] before calling `animate()`. Other
+#' options are not copied, except that the `type` of the `png`, `jpeg`, `tiff`
+#' and `bmp` devices defaults to the main session's `getOption("bitmapType")`,
+#' so the output matches sequential rendering.
+#'
+#' Whether or not frames are rendered in parallel, each distinct warning is
+#' raised once, and frames that fail to render are reported together in one
+#' warning. If every frame fails, `animate()` throws an error.
+#'
+#' @section Layout caching:
+#' Most of the time spent drawing a frame goes on parts of the plot that are
+#' the same in every frame: axes, strips, legends and the theme. With
+#' `options(gganimate.cache_layout = TRUE)` these are rendered once and reused,
+#' and only the layers (plus the title, subtitle and caption, if their text
+#' changes) are redrawn for each frame. The output is the same as without the
+#' cache. It works with and without parallel rendering.
+#'
+#' The cache is only used with [view_static()] (the default view),
+#' `facet_null()`, `facet_wrap()` or `facet_grid()`, and `coord_cartesian()`,
+#' `coord_fixed()` or `coord_flip()`. Other plots, and frames in which any other
+#' label changes, are rendered in full. If the panels can't be found in the
+#' rendered plot, a warning is given and every frame is rendered in full.
+#'
 #' @section Label variables:
 #' All plots have a certain set of variables available for string literal
 #' interpolation within plot labels. These are:
@@ -273,52 +322,418 @@ draw_frames <- function(plot, frames, device, ref_frame, ...) {
     svglite = svglite::svglite,
     current = png
   )
-  args <- list(...)
-  args <- args[names(args) %in% names(formals(device_fn))]
+  dev_args <- list(...)
+  dev_args <- dev_args[names(dev_args) %in% names(formals(device_fn))]
+  dev_args <- resolve_device_defaults(device_fn, dev_args)
 
-  dims <- try_fetch(
-    plot_dims(plot, ref_frame, device = device_fn, dev_args = args),
-    error = function(e) {
-      cli::cli_warn('Cannot get dimensions of plot table. Plot region might not be fixed', parent = e)
-      list(widths = NULL, heights = NULL)
-    }
-  )
+  # Measured on the rendering device, so text is sized as it will be drawn
+  dims <- capture_conditions(plot_dims(plot, ref_frame, device = device_fn, dev_args = dev_args))
+  if (!is.null(dims$error)) {
+    cli::cli_warn(c(
+      'Cannot get dimensions of plot table. Plot region might not be fixed',
+      cli_values(dims$error, 'x')
+    ))
+  }
 
   dir <- tempfile(pattern = '')
   dir.create(dir, showWarnings = FALSE)
   files <- file.path(dir, sprintf('gganim_plot%04d', seq_along(frames)))
   files <- if (stream) files else paste0(files, ext)
-  device <- device_fn
 
+  # How to draw each frame, the same for sequential and parallel rendering
+  render <- list(
+    widths = dims$value$widths,
+    heights = dims$value$heights,
+    # NULL unless options(gganimate.cache_layout = TRUE) and the plot qualifies
+    cache = layout_cache(plot)
+  )
+  if (!stream) {
+    render$device_fn <- device_fn
+    render$dev_args <- dev_args
+  }
+
+  results <- if (!stream && parallel_available()) {
+    render_parallel(plot, frames, files, render)
+  }
+  parallel <- !is.null(results)
+  if (!parallel) results <- render_sequential(plot, frames, files, render)
+  report_frames(results, parallel, dims$warnings)
+
+  frame_vars <- plot$scene$frame_vars[frames, , drop = FALSE]
+  if (!stream) frame_vars$frame_source <- files
+  frame_vars
+}
+
+# Draw one frame: `make_frame()` returns it, from get_frame() or, on a worker,
+# from the parts computed in the main session
+render_one <- function(make_frame, file, render) {
+  if (!is.null(render$device_fn)) {
+    inject(render$device_fn(file, !!!render$dev_args))
+    on.exit(grDevices::dev.off(), add = TRUE)
+  }
+  frame <- make_frame()
+  frame$scene$draw_frame(frame, widths = render$widths, heights = render$heights,
+                         cache = render$cache)
+}
+
+# Evaluate `expr`, keeping its value, the message of any error and the
+# messages of any warnings. Both rendering paths report frames this way, so
+# a warning repeated in every frame is raised once.
+capture_conditions <- function(expr) {
+  warnings <- character()
+  result <- withCallingHandlers(
+    tryCatch(
+      list(value = expr, error = NULL),
+      error = function(e) list(value = NULL, error = condition_text(e))
+    ),
+    warning = function(w) {
+      warnings <<- c(warnings, conditionMessage(w))
+      tryInvokeRestart('muffleWarning')
+    }
+  )
+  result$warnings <- unique(warnings)
+  result
+}
+
+render_sequential <- function(plot, frames, files, render) {
   pb <- progress_bar$new(
     'Rendering [:bar] at :fps fps ~ eta: :eta',
     total = length(frames)
   )
   start <- Sys.time()
   pb$tick(0)
-
+  results <- vector('list', length(frames))
   for (i in seq_along(frames)) {
-    if (!stream) inject(device(files[i], !!!args))
-
-    try_fetch(
-      plot$scene$plot_frame(plot, frames[i], widths = dims$widths, heights = dims$heights),
-      error = function(e) {
-        cli::cli_warn('Failed to plot frame', parent = e)
-      }
+    results[[i]] <- capture_conditions(
+      render_one(function() plot$scene$get_frame(plot, frames[i]), files[i], render)
     )
-
     rate <- i/as.double(Sys.time() - start, units = 'secs')
     if (is.nan(rate)) rate <- 0
     rate <- format(rate, digits = 2)
     pb$tick(tokens = list(fps = rate))
-
-    if (!stream) dev.off()
   }
-
-  frame_vars <- plot$scene$frame_vars[frames, , drop = FALSE]
-  if (!stream) frame_vars$frame_source <- files
-  frame_vars
+  results
 }
+
+report_frames <- function(results, parallel, warnings = character()) {
+  warnings <- unique(c(warnings, unlist(lapply(results, `[[`, 'warnings'))))
+  for (msg in warnings) warning(msg, call. = FALSE)
+
+  errors <- unlist(lapply(results, `[[`, 'error'))
+  n_errors <- length(errors)
+  if (n_errors == 0L) return(invisible())
+  bullets <- cli_values(unique(errors), 'x')
+  # Every frame failing points to the setup (a missing package or font, say)
+  # rather than a bad frame, so don't hand back a blank animation
+  if (n_errors == length(results)) {
+    cli::cli_abort(c(
+      'All {n_errors} frames failed to render',
+      bullets,
+      i = if (parallel) 'Workers get the packages loaded in this session, but not fonts or objects defined in it. Code that runs while a frame is drawn, such as a facet labeller or a custom geom, needs everything it uses set up with {.fn mirai::everywhere} before calling {.fn animate}. Or render sequentially with {.code options(gganimate.parallel = FALSE)}.'
+    ))
+  }
+  cli::cli_warn(c('{n_errors} frame{?s} failed to render', bullets))
+}
+
+# Bullets for cli that show each message as is: braces in them must not be
+# read as cli markup
+cli_values <- function(x, bullet) {
+  x <- gsub('}', '}}', gsub('{', '{{', x, fixed = TRUE), fixed = TRUE)
+  stats::setNames(x, rep(bullet, length(x)))
+}
+
+condition_text <- function(x) {
+  if (inherits(x, 'condition')) conditionMessage(x) else format(x)
+}
+
+# Parallel rendering on mirai workers ------------------------------------------
+#
+# The main session computes every frame (get_frame(): its data, view and
+# labels), exactly as for sequential rendering, so user code that runs per
+# frame (scale functions under a moving view, variables in glue labels) never
+# runs on a worker. Workers only draw. They get, once each, the plot without
+# its tweened data plus each frame's parts; each task is just a frame index.
+
+parallel_available <- function() {
+  isTRUE(getOption('gganimate.parallel', TRUE)) &&
+    # Daemons can only be running if mirai is loaded; don't load it to find out
+    isNamespaceLoaded('mirai') &&
+    isTRUE(tryCatch(mirai::status()$connections > 0L, error = function(e) FALSE))
+}
+
+# Returns NULL, having warned, if the workers could not be set up
+render_parallel <- function(plot, frames, files, render) {
+  static_panel_params <- plot$layout$panel_params
+  prepared <- lapply(frames, function(i) {
+    capture_conditions(frame_parts(plot$scene$get_frame(plot, i), static_panel_params))
+  })
+  ok <- vapply(prepared, function(p) is.null(p$error), logical(1))
+
+  skeleton <- plot
+  skeleton$data <- NULL
+  job <- detach_frames(list(
+    plot = skeleton,
+    parts = lapply(prepared[ok], `[[`, 'value'),
+    guides = lapply(plot$layout$panel_params, `[[`, 'guides')
+  ))
+  job$plot <- drawing_kit(job$plot)
+  job$files <- files[ok]
+  job$render <- render
+  on.exit(clear_workers(), add = TRUE)
+  if (!setup_workers(job)) return(NULL)
+
+  rendered <- mirai::mirai_map(seq_len(sum(ok)), render_frame_on_worker)[mirai::.progress]
+  results <- prepared
+  results[ok] <- Map(function(p, r) {
+    if (mirai::is_error_value(r)) r <- list(error = condition_text(r))
+    list(error = r$error, warnings = c(p$warnings, r$warnings))
+  }, prepared[ok], rendered)
+  results
+}
+
+# Trims a copy of a built plot, made by detach_frames(), to what drawing a
+# frame uses: the layout, the plot (layers, theme, guides, labels) and the
+# scene's draw_frame(). What only preparing frames needs (the plot's and
+# layers' original data, the transition, view, shadow and transmuters) stays in
+# the session.
+# The copy's ggproto objects are its own, so they can be changed in place.
+drawing_kit <- function(plot) {
+  # Keep a draw_frame() set on this scene rather than inherited from Scene
+  own_draw <- get0('draw_frame', envir = plot$scene, inherits = FALSE)
+  scene <- if (is.null(own_draw)) ggproto(NULL, Scene) else ggproto(NULL, Scene, draw_frame = own_draw)
+  # Made here, it would otherwise keep this frame and with it the whole plot
+  scene$super <- parent_finder(Scene)
+  plot$scene <- scene
+  gg <- plot$plot
+  gg@meta <- gg@meta[setdiff(names(gg@meta), c('transition', 'view', 'shadow', 'transmuters', 'ease', 'nframes'))]
+  # As for a plot made without data; each frame's data is sent separately
+  gg@data <- waiver()
+  for (layer in gg@layers) layer$data <- NULL
+  plot$plot <- gg
+  plot
+}
+
+# A ggproto object made inside a function keeps that function's frame, through
+# the closure that finds its parent (`super`), and through unevaluated
+# arguments in that frame, the frames of its callers too. For a built plot
+# those reach the build itself, with every layer's data for every frame: a
+# panel's Guides object alone can serialise to hundreds of megabytes. This
+# copies each ggproto object in `x` with a `super` that holds only its parent.
+# The session's objects are left as they are, and objects shared within `x`
+# stay shared.
+detach_frames <- function(x, copies = new.env(parent = emptyenv())) {
+  # A method bound to an object, e.g. a scale's palette, keeps the frame it was
+  # fetched in through its unevaluated `self`
+  if (inherits(x, 'ggproto_method')) {
+    method <- environment(x)
+    return(bound_method(detach_frames(method$f, copies), detach_frames(method$self, copies), method$has_self))
+  }
+  if (inherits(x, 'ggproto')) {
+    key <- rlang::obj_address(x)
+    if (!is.null(copies[[key]])) return(copies[[key]])
+    copy <- new.env(parent = emptyenv())
+    # Registered before its fields, which may refer back to it
+    copies[[key]] <- copy
+    for (name in ls(x, all.names = TRUE)) {
+      assign(name, detach_frames(get(name, envir = x), copies), envir = copy)
+    }
+    find_parent <- get0('super', envir = x, inherits = FALSE)
+    if (is.function(find_parent)) {
+      copy$super <- parent_finder(detach_frames(find_parent(), copies))
+    }
+    class(copy) <- class(x)
+    return(copy)
+  }
+  if (is.list(x) && !is.data.frame(x)) {
+    items <- lapply(x, detach_frames, copies = copies)
+    # Rebuilt only if needed, and without `[<-`, which some classes forbid
+    if (!all(mapply(identical, items, x))) {
+      attrs <- attributes(x)
+      x <- items
+      attributes(x) <- attrs
+    }
+  }
+  # S7 objects such as the ggplot object keep their properties as attributes
+  if (inherits(x, 'S7_object')) {
+    for (name in setdiff(names(attributes(x)), c('class', 'S7_class'))) {
+      attr(x, name) <- detach_frames(attr(x, name), copies)
+    }
+  }
+  x
+}
+
+parent_finder <- function(parent) {
+  force(parent)
+  function() parent
+}
+
+# As ggplot2 binds a method to its object when it is fetched with `$`
+bound_method <- function(f, self, has_self) {
+  # Unevaluated, they would keep the caller's frame
+  force(f)
+  force(self)
+  method <- if (isTRUE(has_self)) function(...) f(..., self = self) else function(...) f(...)
+  class(method) <- 'ggproto_method'
+  method
+}
+
+# What a worker needs to rebuild a frame: its data and labels and, if the view
+# moved, its panel ranges. Each moving-view frame has a new Guides object,
+# which keeps the frames that built it (see detach_frames()), so only its
+# params (breaks, labels, positions) are sent.
+frame_parts <- function(frame, static_panel_params) {
+  parts <- list(data = frame$data, labels = frame$plot$labels)
+  panel_params <- frame$layout$panel_params
+  if (!identical(panel_params, static_panel_params)) {
+    parts$coord_limits <- frame$layout$coord$limits
+    parts$panel_params <- lapply(panel_params, function(p) {
+      if (inherits(p$guides, 'Guides')) p$guides <- p$guides$params
+      p
+    })
+  }
+  parts
+}
+
+# Runs on a worker. `guides` holds a Guides object per panel to rebuild from.
+assemble_frame <- function(plot, parts, guides) {
+  plot$data <- parts$data
+  plot$plot$labels <- parts$labels
+  if (!is.null(parts$panel_params)) {
+    plot$layout$coord$limits <- parts$coord_limits
+    plot$layout$panel_params <- Map(function(p, template) {
+      if (!is.null(p$guides)) p$guides <- ggproto(NULL, template, params = p$guides)
+      p
+    }, parts$panel_params, guides)
+  }
+  plot
+}
+
+# Runs on a worker. A top-level function serialises with a reference to the
+# gganimate namespace, not a copy of its environment.
+render_frame_on_worker <- function(k) {
+  job <- get('.gganimate_job', envir = globalenv())
+  capture_conditions(render_one(
+    function() assemble_frame(job$plot, job$parts[[k]], job$guides),
+    job$files[[k]], job$render
+  ))
+}
+
+# Workers first load and attach the session's packages: drawing can need S3
+# methods (e.g. element_grob() for a theme element from another package) and
+# functions called without `pkg::`. Then each gets the job, once. That has to
+# come second: unserialising the job loads the namespaces its functions refer
+# to, which must be the session's versions (see prepare_worker()). Named `...`
+# arguments to everywhere() persist in the worker's global environment; `.args`
+# would not. Fonts and objects defined in the session must be set up by the
+# caller with mirai::everywhere() before animate().
+# Returns FALSE, with a warning, if any worker could not be set up.
+setup_workers <- function(job) {
+  setup <- mirai::everywhere(
+    worker_setup,
+    .args = list(
+      prepare_worker = by_value(prepare_worker),
+      packages = session_packages(),
+      libs = .libPaths()
+    )
+  )[]
+  failed <- Filter(mirai::is_error_value, setup)
+  if (length(failed) == 0L) {
+    sent <- mirai::everywhere(TRUE, .gganimate_job = job)[]
+    failed <- Filter(mirai::is_error_value, sent)
+  }
+  if (length(failed) == 0L) return(TRUE)
+  cli::cli_warn(c(
+    'Could not set up the mirai workers, so frames will be rendered sequentially',
+    cli_values(condition_text(failed[[1]]), 'x')
+  ))
+  FALSE
+}
+
+# Quoted: its variables come from everywhere()'s `.args`
+worker_setup <- quote(prepare_worker(packages, libs))
+
+# A copy of a function that serialises with its code rather than as a
+# reference to the gganimate namespace, so a worker can run it before loading
+# gganimate. It may only use base R and `pkg::` calls.
+by_value <- function(fn) {
+  environment(fn) <- baseenv()
+  fn
+}
+
+session_packages <- function() {
+  base <- c('base', 'datasets', 'graphics', 'grDevices', 'methods', 'stats', 'utils')
+  loaded <- setdiff(loadedNamespaces(), base)
+  attached <- sub('^package:', '', grep('^package:', search(), value = TRUE))
+  dev <- if (isNamespaceLoaded('pkgload')) Filter(pkgload::is_dev_package, loaded)
+  list(
+    loaded = loaded,
+    # Attach from the end of the search path so the order matches the session
+    attached = rev(setdiff(attached, base)),
+    # Source directories of packages loaded with pkgload::load_all()
+    dev = vapply(dev, getNamespaceInfo, character(1), which = 'path')
+  )
+}
+
+# Runs on a worker, sent by value (see by_value()).
+#
+# Packages loaded with pkgload::load_all() in the session, possibly gganimate
+# itself, are loaded from the same source directory, before anything else can
+# load the installed copy. A worker keeps the packages it has loaded between
+# calls, so it reloads one only when its files have changed. The worker then
+# has the files on disk, which differ from the session's code only if they
+# were edited without reloading.
+prepare_worker <- function(packages, libs) {
+  .libPaths(unique(c(libs[dir.exists(libs)], .libPaths())))
+
+  dev_loaded <- getOption('gganimate.worker_dev_loaded', list())
+  for (path in packages$dev) {
+    sources <- c(
+      file.path(path, c('DESCRIPTION', 'NAMESPACE')),
+      list.files(file.path(path, c('R', 'src')), recursive = TRUE, full.names = TRUE)
+    )
+    fingerprint <- unname(tools::md5sum(sources))
+    if (!identical(dev_loaded[[path]], fingerprint)) {
+      # The session has compiled any code already; workers compiling in the
+      # same directory at once would collide
+      pkgload::load_all(path, compile = FALSE, helpers = FALSE, quiet = TRUE)
+      dev_loaded[[path]] <- fingerprint
+    }
+  }
+  # everywhere() keeps changes to options, so this persists on the worker
+  options(gganimate.worker_dev_loaded = dev_loaded)
+
+  available <- vapply(packages$loaded, requireNamespace, logical(1), quietly = TRUE)
+  if (!all(available)) {
+    stop(
+      'Packages loaded in the main session are not installed for the workers: ',
+      paste(packages$loaded[!available], collapse = ', '),
+      call. = FALSE
+    )
+  }
+  for (pkg in packages$attached) {
+    if (!paste0('package:', pkg) %in% search()) {
+      suppressPackageStartupMessages(attachNamespace(pkg))
+    }
+  }
+  TRUE
+}
+
+clear_workers <- function() {
+  mirai::everywhere(suppressWarnings(rm(list = '.gganimate_job', envir = globalenv())))
+}
+
+# Workers start with fresh options, so device defaults that read the session's
+# options must be resolved here. grDevices' bitmap devices (png, jpeg, tiff,
+# bmp) default `type` to getOption("bitmapType"), which e.g. RStudio changes.
+resolve_device_defaults <- function(device_fn, dev_args) {
+  is_bitmap_device <- identical(environment(device_fn), asNamespace('grDevices')) &&
+    'type' %in% names(formals(device_fn))
+  if (is_bitmap_device && is.null(dev_args$type)) {
+    dev_args$type <- getOption('bitmapType')
+  }
+  dev_args
+}
+
 # Get dimensions of plot based on a reference frame
 plot_dims <- function(plot, ref_frame, device = png, dev_args = list()) {
   tmpf <- tempfile()
@@ -348,11 +763,6 @@ plot_dims <- function(plot, ref_frame, device = png, dev_args = list()) {
 is_knitting <- function() isTRUE(getOption("knitr.in.progress"))
 
 render_frame <- function(frame) {
-  class_ggplot_built <- get0("class_ggplot_built", asNamespace("ggplot2"))
-  if (is.function(class_ggplot_built)) {
-    frame <- class_ggplot_built(data = frame$data, layout = frame$layout, plot = frame$plot)
-  } else {
-    class(frame) <- "ggplot_built"
-  }
+  frame <- ggplot2::class_ggplot_built(data = frame$data, layout = frame$layout, plot = frame$plot)
   ggplot_gtable(frame)
 }

@@ -1,5 +1,20 @@
 # gganimate (development version)
 
+* gganimate now requires ggplot2 4.0.0 or later.
+* New `options(gganimate.cache_layout = TRUE)` renders the parts of the plot
+  that don't change between frames (axes, strips, legends) once and reuses
+  them, which can make rendering about twice as fast. It applies to plots with a
+  static view, the built-in facets and cartesian, fixed or flipped coords.
+* Frames are now rendered in parallel when mirai daemons are running (set up
+  with `mirai::daemons()`). Frames are prepared in the main session and drawn
+  on the workers, which load the session's packages (from source, for
+  packages loaded with `pkgload::load_all()`). Use
+  `options(gganimate.parallel = FALSE)` to opt out.
+* Warnings raised while rendering are given once per animation rather than once
+  per frame, failed frames are reported together, and `animate()` throws an
+  error if every frame fails.
+* A label that glue can't interpolate now gives a warning instead of being
+  silently shown as written.
 * Fix `view_step()` ignoring `wrap = FALSE` (#499), without regressing the
   timing of the default `wrap = TRUE` case as an earlier attempt at this fix
   did
